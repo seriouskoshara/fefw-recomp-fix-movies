@@ -89,7 +89,7 @@ jobs:
           Copy-Item runtime/third_party/dav1d/COPYING "$out/licenses/LICENSE.dav1d.txt"
           Copy-Item tools/textures/THIRD_PARTY.md "$out/licenses/THIRD_PARTY.textures.md"
           Copy-Item tools/textures/third_party/astc-encoder/LICENSE.txt "$out/licenses/LICENSE.astc-encoder.txt"
-          Copy-Item tools/textures/third_party/bc7enc_rdo/LICENSE "$out/licenses/LICENSE.bc7enc_rdo.txt
+          Copy-Item tools/textures/third_party/bc7enc_rdo/LICENSE "$out/licenses/LICENSE.bc7enc_rdo.txt"
           $revision = (git rev-parse HEAD).Trim()
           $nasmVersion = (& nasm -v | Out-String).Trim()
           @(
