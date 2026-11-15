@@ -1,0 +1,117 @@
+name: Build runtime with dav1d ASM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      LLVM_VERSION: '23.1.5'
+      LLVM_SHA256: 'b2be33385ddc86e83511417a060de927ae8b09d1f3017cc3cdce5c73cd5029d7'
+      NX_JOBS: '4'
+    steps:
+      - name: Check out the v0.2.0 source revision
+        uses: actions/checkout@v4
+        with:
+          repository: metrist38/fefw-recomp
+          ref: 4665954d2c6c662587d1576cb496101f6f16e79b
+          persist-credentials: false
+
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1
+        with:
+          version: '2.16.01'
+
+      - name: Download and verify LLVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/toolchain/llvm
+          cd work/toolchain
+          curl --fail --location --retry 3 -o llvm.tar.zst "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang%2Bllvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
+          echo "$LLVM_SHA256  llvm.tar.zst" | sha256sum -c -
+          zstd -dc --long=31 llvm.tar.zst | tar -xf - -C llvm --strip-components=1 --wildcards '*/bin/*' '*/lib/clang/*'
+          rm llvm.tar.zst
+
+      - name: Set up the toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = (Resolve-Path 'work/toolchain/llvm/bin').Path
+          "NX_LLVM_BIN=$bin" >> $env:GITHUB_ENV
+          & "$bin/clang-cl.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'clang-cl check failed' }
+          & nasm -v
+          if ($LASTEXITCODE -ne 0) { throw 'NASM check failed' }
+
+      - name: Fetch the upstream texture-transcoder dependencies
+        run: |
+          & ./tools/textures/scripts/fetch_third_party.ps1
+          if (-not $?) { throw 'Dependency preparation failed' }
+          if (-not (Test-Path 'tools/textures/third_party/astc-encoder/Source/astcenc.h')) {
+            throw 'The ASTC decoder sources are missing'
+          }
+          if (-not (Test-Path 'tools/textures/third_party/bc7enc_rdo/rgbcx.cpp')) {
+            throw 'The BC7 encoder sources are missing'
+          }
+
+      - name: Build fefw_rt.dll with dav1d assembly required
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nasm = (Get-Command nasm -ErrorAction Stop).Source.Replace('\', '/')
+          $flags = '-DFEFW_RT_DLL=ON -DNXRT_DAV1D=ON -DNXRT_DAV1D_ASM=ON -DNXRT_ASTC2BC7=ON -DNXRT_NASM="{0}"' -f $nasm
+          & ./game-build/scripts/build_fefw.ps1 -Target fefw_rt -BuildDir build/dav1d-asm -Jobs 4 -CMakeArgs $flags
+          if ($LASTEXITCODE -ne 0) { throw "Build failed: $LASTEXITCODE" }
+
+      - name: Verify ASM objects and collect the replacement DLL
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = 'game-build/fefw/build/dav1d-asm'
+          $cache = Get-Content "$build/CMakeCache.txt" -Raw
+          if ($cache -notmatch '(?m)^NXRT_DAV1D_ASM:BOOL=ON\s*$') {
+            throw 'Assembly was not enabled in the CMake cache'
+          }
+          $objects = @(Get-ChildItem "$build/third_party/dav1d/asm" -Filter '*.obj' -File)
+          if ($objects.Count -lt 20) { throw "Too few dav1d assembly objects: $($objects.Count)" }
+          if (-not (Test-Path "$build/fefw_rt.dll")) { throw 'fefw_rt.dll was not built' }
+          $out = 'artifact'
+          New-Item -ItemType Directory -Force "$out/licenses" | Out-Null
+          Copy-Item "$build/fefw_rt.dll" "$out/fefw_rt.dll"
+          Copy-Item LICENSE "$out/licenses/LICENSE.fefw.txt"
+          Copy-Item runtime/THIRD_PARTY_NOTICES.md "$out/licenses/THIRD_PARTY_NOTICES.md"
+          Copy-Item runtime/third_party/dav1d/COPYING "$out/licenses/LICENSE.dav1d.txt"
+          Copy-Item tools/textures/THIRD_PARTY.md "$out/licenses/THIRD_PARTY.textures.md"
+          Copy-Item tools/textures/third_party/astc-encoder/LICENSE.txt "$out/licenses/LICENSE.astc-encoder.txt"
+          Copy-Item tools/textures/third_party/bc7enc_rdo/LICENSE "$out/licenses/LICENSE.bc7enc_rdo.txt
+          $revision = (git rev-parse HEAD).Trim()
+          $nasmVersion = (& nasm -v | Out-String).Trim()
+          @(
+            "Source: https://github.com/metrist38/fefw-recomp/tree/$revision"
+            "Revision: $revision"
+            "LLVM: $env:LLVM_VERSION"
+            "Assembler: $nasmVersion"
+            'NXRT_DAV1D_ASM=ON'
+            "dav1d ASM object count: $($objects.Count)"
+            'Only the runtime DLL was built. No game files or lifted game code are included.'
+            'This artifact has not been tested in the game.'
+            'Back up your existing DLL before replacing it. See the instructions accompanying the workflow.'
+          ) | Set-Content "$out/BUILD-INFO.txt" -Encoding utf8
+          $hash = (Get-FileHash "$out/fefw_rt.dll" -Algorithm SHA256).Hash.ToLower()
+          "$hash  fefw_rt.dll" | Set-Content "$out/SHA256SUMS.txt" -Encoding ascii
+          Copy-Item "$build/CMakeCache.txt" "$out/CMakeCache.txt"
+          @('### Build verification', '', "- dav1d ASM objects: $($objects.Count)", "- Source revision: $revision", "- DLL SHA256: $hash", '- Gameplay and playback have not been tested.') >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload the compiled DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: fefw-0.2.0-runtime-dav1d-asm-win64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
